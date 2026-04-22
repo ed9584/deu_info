@@ -10,7 +10,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 from deu_nexus import APP_NAME, APP_NAME_KO
 from deu_nexus.chat import answer_with_sources
-from deu_nexus.crawler import run_crawl
+from deu_nexus.crawler import run_list_page
 
 app = Flask(__name__)
 
@@ -31,9 +31,10 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     h1 { font-size: 1.2rem; font-weight: 600; margin: 0 0 0.25rem; }
     .subtitle { font-size: 0.8rem; color: var(--muted); margin: 0 0 1rem; }
     h2 { font-size: 0.95rem; color: var(--muted); margin: 0 0 0.5rem; font-weight: 600; }
-    form { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: flex-end; margin-bottom: 1rem; padding: 1rem; background: var(--card); border-radius: 10px; border: 1px solid var(--border); }
+    form { display: flex; gap: 0.6rem; align-items: center; margin-bottom: 1rem; padding: 0.9rem; background: var(--card); border-radius: 10px; border: 1px solid var(--border); }
     label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.8rem; color: var(--muted); }
-    input[type="text"], input[type="number"] { padding: 0.45rem 0.6rem; border-radius: 6px; border: 1px solid var(--border); background: #0d1218; color: var(--text); min-width: 8rem; }
+    input[type="text"] { padding: 0.55rem 0.65rem; border-radius: 8px; border: 1px solid var(--border); background: #0d1218; color: var(--text); min-width: 18rem; flex: 1; }
+    .spacer { flex: 1; }
     input[type="checkbox"] { width: 1rem; height: 1rem; }
     button, .btn { padding: 0.5rem 1rem; border-radius: 8px; border: none; background: var(--accent); color: #0a0e12; font-weight: 600; cursor: pointer; font-size: 0.9rem; }
     button:hover, .btn:hover { filter: brightness(1.08); }
@@ -59,6 +60,10 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     textarea { width: 100%; min-height: 4.5rem; resize: vertical; padding: 0.55rem 0.65rem; border-radius: 8px; border: 1px solid var(--border); background: #0d1218; color: var(--text); font-family: inherit; font-size: 0.9rem; }
     .row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
     .pill { font-size: 0.72rem; color: var(--muted); }
+    .pager { display:flex; gap:0.35rem; justify-content:center; padding: 0.9rem 0; }
+    .pg { background: transparent; border: 1px solid var(--border); color: var(--text); padding: 0.35rem 0.65rem; border-radius: 8px; cursor: pointer; }
+    .pg.on { background: rgba(91,159,212,0.18); border-color: rgba(91,159,212,0.55); }
+    .loading { color: var(--muted); font-size: 0.85rem; }
   </style>
 </head>
 <body>
@@ -66,34 +71,13 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     <div class="main">
       <h1>""" + APP_NAME_KO + """</h1>
       <p class="subtitle">DESS 공지 · SQLite · Chroma · LangChain RAG</p>
-      <form method="get" action="{{ url_for('index') }}">
-        <label>페이지 수
-          <input type="number" name="pages" min="1" max="20" value="{{ pages }}">
-        </label>
-        <label>게시판 mid
-          <input type="text" name="mid" value="{{ mid }}" placeholder="Notice">
-        </label>
-        <label>키워드 (공백 구분)
-          <input type="text" name="keywords" value="{{ keywords }}" placeholder="캡스톤 디자인 협업" style="min-width:14rem;">
-        </label>
-        <label style="flex-direction:row; align-items:center; gap:0.4rem;">
-          <input type="checkbox" name="no_filter" value="1" {% if no_filter %}checked{% endif %}>
-          필터 끄기 (전체)
-        </label>
-        <label style="flex-direction:row; align-items:center; gap:0.4rem;">
-          <input type="checkbox" name="match_all" value="1" {% if match_all %}checked{% endif %}>
-          키워드 모두 포함
-        </label>
-        <button type="submit">목록 새로고침</button>
+      <form id="searchForm">
+        <input id="kw" type="text" placeholder="검색어를 입력하세요 (예: 키스톤, 캡스톤, 복학)" autocomplete="off">
+        <button type="submit">검색</button>
+        <button type="button" class="pg" id="clearBtn">초기화</button>
       </form>
-      {% if error %}
-      <p class="err">{{ error }}</p>
-      {% endif %}
-      {% if data %}
-      <p class="meta">
-        출처: {{ data.source.base }} · mid={{ data.source.mid }} ·
-        목록 {{ data.count_total }}건 · 표시 {{ data.count_matched }}건
-      </p>
+      <p class="meta" id="metaLine"></p>
+      <p class="loading" id="loading" style="display:none;">불러오는 중…</p>
       <table>
         <thead>
           <tr>
@@ -104,19 +88,9 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
             <th>조회</th>
           </tr>
         </thead>
-        <tbody>
-          {% for a in data.articles %}
-          <tr>
-            <td>{% if a.is_notice %}<span class="tag">공지</span>{% else %}{{ a.list_no }}{% endif %}</td>
-            <td><a href="{{ a.url }}" target="_blank" rel="noopener">{{ a.title }}</a></td>
-            <td>{{ a.author }}</td>
-            <td>{{ a.posted }}</td>
-            <td>{{ a.views }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
+        <tbody id="listBody"></tbody>
       </table>
-      {% endif %}
+      <div class="pager" id="pager"></div>
     </div>
     <aside class="chat-panel">
       <div class="chat-head">
@@ -140,6 +114,77 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     </aside>
   </div>
   <script>
+  // ----- list (검색 + 페이지네이션) -----
+  const listBody = document.getElementById('listBody');
+  const pager = document.getElementById('pager');
+  const kw = document.getElementById('kw');
+  const metaLine = document.getElementById('metaLine');
+  const loading = document.getElementById('loading');
+  const clearBtn = document.getElementById('clearBtn');
+  const searchForm = document.getElementById('searchForm');
+  const PAGE_NAV = 3; // 하단 1 2 3
+  let currentPage = 1;
+
+  function esc(s){ return (s||'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;'); }
+
+  function renderPager() {
+    pager.innerHTML = '';
+    for (let p = 1; p <= PAGE_NAV; p++) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'pg' + (p === currentPage ? ' on' : '');
+      b.textContent = String(p);
+      b.addEventListener('click', () => loadPage(p));
+      pager.appendChild(b);
+    }
+  }
+
+  function renderRows(rows) {
+    if (!rows || rows.length === 0) {
+      listBody.innerHTML = '<tr><td colspan="5" class="loading">결과가 없습니다.</td></tr>';
+      return;
+    }
+    listBody.innerHTML = rows.map(a => {
+      const no = a.is_notice ? '<span class="tag">공지</span>' : esc(a.list_no);
+      const title = '<a href=\"' + esc(a.url) + '\" target=\"_blank\" rel=\"noopener\">' + esc(a.title) + '</a>';
+      return '<tr>' +
+        '<td>' + no + '</td>' +
+        '<td>' + title + '</td>' +
+        '<td>' + esc(a.author) + '</td>' +
+        '<td>' + esc(a.posted) + '</td>' +
+        '<td>' + esc(a.views) + '</td>' +
+      '</tr>';
+    }).join('');
+  }
+
+  async function loadPage(p) {
+    currentPage = p;
+    renderPager();
+    loading.style.display = 'block';
+    metaLine.textContent = '';
+    try {
+      const q = (kw.value || '').trim();
+      const url = new URL('/api/list', window.location.origin);
+      url.searchParams.set('page', String(p));
+      if (q) url.searchParams.set('q', q);
+      const r = await fetch(url.toString(), { method: 'GET' });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+      renderRows(j.articles || []);
+      const src = j.source || {};
+      metaLine.textContent = `출처: ${src.base || ''} · mid=${src.mid || ''} · page=${src.page || p} · 목록 ${j.count_total || 0}건 · 표시 ${j.count_matched || 0}건`;
+    } catch (e) {
+      listBody.innerHTML = '<tr><td colspan="5" class="err">오류: ' + esc(e.message) + '</td></tr>';
+    } finally {
+      loading.style.display = 'none';
+    }
+  }
+
+  searchForm.addEventListener('submit', (e) => { e.preventDefault(); loadPage(1); });
+  clearBtn.addEventListener('click', () => { kw.value=''; loadPage(1); });
+  renderPager();
+  loadPage(1);
+
   const msgs = document.getElementById('msgs');
   const q = document.getElementById('q');
   const send = document.getElementById('send');
@@ -219,53 +264,36 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 """
 
 
-def _parse_keywords(s: str) -> list[str]:
-    parts = []
-    for chunk in (s or "").replace(",", " ").split():
-        t = chunk.strip()
-        if t:
-            parts.append(t)
-    return parts
-
-
 @app.route("/")
 def index():
-    pages = request.args.get("pages", default="3", type=str)
-    mid = request.args.get("mid", default="Notice", type=str) or "Notice"
-    keywords_raw = request.args.get("keywords", default="키스톤 캡스톤 디자인 협업", type=str)
-    no_filter = request.args.get("no_filter") == "1"
-    match_all = request.args.get("match_all") == "1"
+    return render_template_string(PAGE_TEMPLATE)
 
+
+@app.get("/api/list")
+def api_list():
+    mid = (request.args.get("mid") or "Notice").strip() or "Notice"
     try:
-        pages_n = max(1, min(20, int(pages)))
+        page = int(request.args.get("page") or "1")
     except ValueError:
-        pages_n = 3
+        page = 1
+    page = max(1, min(50, page))
+    q = (request.args.get("q") or "").strip()
+    keywords = [q] if q else []
+    no_filter = not bool(q)
 
-    data = None
-    error = None
     try:
-        data = run_crawl(
-            mid=mid.strip() or "Notice",
-            pages=pages_n,
-            delay=0.6,
-            keywords=_parse_keywords(keywords_raw),
-            match_all=match_all,
+        data = run_list_page(
+            mid=mid,
+            page=page,
+            keywords=keywords,
+            match_all=False,
             no_filter=no_filter,
             fetch_body=False,
+            headless=True,
         )
     except Exception as e:
-        error = str(e)
-
-    return render_template_string(
-        PAGE_TEMPLATE,
-        data=data,
-        error=error,
-        pages=pages_n,
-        mid=mid,
-        keywords=keywords_raw,
-        no_filter=no_filter,
-        match_all=match_all,
-    )
+        return jsonify({"error": str(e)}), 500
+    return jsonify(data)
 
 
 @app.post("/api/chat")
