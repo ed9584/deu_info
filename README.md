@@ -15,10 +15,11 @@
 
 ## 설치 및 실행 방법
 
-아래 커맨드는 프로젝트 루트(= `requirements.txt`가 있는 폴더)에서 실행
+아래 커맨드는 **프로젝트 루트(= `requirements.txt`가 있는 폴더)** 에서 실행합니다.
+먼저 레포를 클론(또는 다운로드)한 폴더로 이동하세요.
 
 ```bash
-cd /Users/404/Desktop/-Happy-/prj/Crawling
+cd <your-repo-directory>
 ```
 
 ### 1) 가상환경 생성 및 의존성 설치
