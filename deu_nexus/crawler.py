@@ -10,6 +10,7 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Iterable
 from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
 from selenium.webdriver.chrome.options import Options as ChromeOptions
@@ -19,6 +20,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 DEFAULT_BASE = "https://dess.deu.ac.kr/"
+DEFAULT_DEU_NOTICE_URL = "https://www.deu.ac.kr/www/deu-notice.do"
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -112,6 +114,86 @@ def parse_list_page(html: str, list_url: str) -> list[ArticleRow]:
             )
         )
     return rows
+
+
+def fetch_url_html(url: str) -> str:
+    """간단 GET (대표 홈페이지 공지처럼 정적 페이지용)."""
+    req = Request(url, headers={"User-Agent": DEFAULT_USER_AGENT})
+    with urlopen(req, timeout=30) as r:  # nosec - controlled URL
+        data = r.read()
+    try:
+        return data.decode("utf-8", errors="replace")
+    except Exception:
+        return data.decode(errors="replace")
+
+
+def parse_deu_notice_list_page(html: str, base_url: str) -> list[ArticleRow]:
+    """
+    동의대 대표 홈페이지 공지 목록 파싱.
+    - URL 예: https://www.deu.ac.kr/www/deu-notice.do
+    """
+    soup = BeautifulSoup(html, "lxml")
+    table = soup.select_one("table")
+    if not table:
+        return []
+
+    rows: list[ArticleRow] = []
+    for tr in table.select("tbody tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 4:
+            continue
+        no = _text(tds[0])
+        title_a = tds[1].select_one("a[href]")
+        title = _text(title_a) if title_a else _text(tds[1])
+        href = title_a.get("href") if title_a else ""
+        abs_url = urljoin(base_url, href)
+        author = _text(tds[2])
+        posted = _text(tds[3])
+        views = _text(tds[-1])
+        rows.append(
+            ArticleRow(
+                list_no=no,
+                title=title,
+                url=abs_url,
+                document_srl=_extract_document_srl(abs_url),
+                author=author,
+                posted=posted,
+                views=views,
+                is_notice=False,
+            )
+        )
+    return rows
+
+
+def run_deu_notice_crawl(
+    *,
+    base_url: str = DEFAULT_DEU_NOTICE_URL,
+    pages: int = 3,
+    limit: int = 10,
+) -> dict:
+    """
+    대표 홈페이지 공지 목록을 pages만큼 수집.
+    deu-notice는 offset/limit 기반이라 page=1..N을 offset으로 변환.
+    """
+    pages = max(1, min(50, int(pages)))
+    limit = max(5, min(50, int(limit)))
+    all_rows: list[ArticleRow] = []
+    for p in range(1, pages + 1):
+        offset = (p - 1) * limit
+        url = f"{base_url}?article.offset={offset}&articleLimit={limit}"
+        html = fetch_url_html(url)
+        rows = parse_deu_notice_list_page(html, base_url)
+        if not rows:
+            break
+        all_rows.extend(rows)
+
+    out = [asdict(r) for r in all_rows]
+    return {
+        "source": {"base": base_url, "mid": "deu-notice", "pages_scanned": pages},
+        "count_total": len(all_rows),
+        "count_matched": len(out),
+        "articles": out,
+    }
 
 
 def fetch_list(
@@ -292,13 +374,17 @@ if __name__ == "__main__":
 
 __all__ = [
     "DEFAULT_BASE",
+    "DEFAULT_DEU_NOTICE_URL",
     "DEFAULT_USER_AGENT",
     "ArticleRow",
     "build_driver",
     "fetch_page_html",
+    "fetch_url_html",
     "fetch_list",
     "fetch_article_body",
+    "parse_deu_notice_list_page",
     "parse_list_page",
     "run_crawl",
     "run_list_page",
+    "run_deu_notice_crawl",
 ]
