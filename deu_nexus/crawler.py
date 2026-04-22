@@ -170,6 +170,7 @@ def run_deu_notice_crawl(
     base_url: str = DEFAULT_DEU_NOTICE_URL,
     pages: int = 3,
     limit: int = 10,
+    cancel_event=None,
 ) -> dict:
     """
     대표 홈페이지 공지 목록을 pages만큼 수집.
@@ -179,6 +180,8 @@ def run_deu_notice_crawl(
     limit = max(5, min(50, int(limit)))
     all_rows: list[ArticleRow] = []
     for p in range(1, pages + 1):
+        if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+            break
         offset = (p - 1) * limit
         url = f"{base_url}?article.offset={offset}&articleLimit={limit}"
         html = fetch_url_html(url)
@@ -255,12 +258,15 @@ def run_crawl(
     no_filter: bool = False,
     fetch_body: bool = False,
     headless: bool = True,
+    cancel_event=None,
 ) -> dict:
     """크롤 실행 후 JSON 직렬화 가능한 dict 반환."""
     driver = build_driver(headless=headless)
     try:
         all_rows: list[ArticleRow] = []
         for page in range(1, max(1, pages) + 1):
+            if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+                break
             html, list_url = fetch_list(driver, base=base, mid=mid, page=page)
             rows = parse_list_page(html, list_url)
             if not rows:
@@ -274,6 +280,8 @@ def run_crawl(
 
         out: list[dict] = []
         for r in matched:
+            if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+                break
             d = asdict(r)
             if fetch_body:
                 time.sleep(max(0.0, delay))

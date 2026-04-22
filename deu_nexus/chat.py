@@ -30,4 +30,28 @@ def answer_with_sources(
         mid=mid,
         pages=pages,
         enrich_bodies=include_article_bodies,
+        cancel_event=None,
+    )
+
+
+def answer_with_sources_cancellable(
+    user_message: str,
+    *,
+    mid: str = "Notice",
+    pages: int = 4,
+    include_article_bodies: bool = False,
+    cancel_event=None,
+) -> Dict[str, Any]:
+    """서버 취소 토큰(cancel_event)을 받아 중단 가능한 응답 생성."""
+    if not user_message or not isinstance(user_message, str):
+        raise ValueError("user_message must be a non-empty string.")
+
+    from deu_nexus.rag import answer_with_rag
+
+    return answer_with_rag(
+        user_message,
+        mid=mid,
+        pages=pages,
+        enrich_bodies=include_article_bodies,
+        cancel_event=cancel_event,
     )

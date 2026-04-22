@@ -15,6 +15,17 @@ from deu_nexus.crawler import DEFAULT_BASE, DEFAULT_DEU_NOTICE_URL, run_crawl, r
 
 app = Flask(__name__)
 
+# ----- chat jobs (server-side cancel) -----
+import threading
+import uuid
+
+_CHAT_JOBS: dict[str, dict] = {}
+_CHAT_LOCK = threading.Lock()
+
+
+def _new_job_id() -> str:
+    return uuid.uuid4().hex
+
 PAGE_TEMPLATE = """<!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -129,7 +140,10 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       <div class="msgs" id="msgs"></div>
       <div class="chat-input">
         <textarea id="q" placeholder="예: 2026학년도 2학기 복학 일정이 뭐야?"></textarea>
-        <button type="button" id="send">보내기</button>
+        <div class="row" style="justify-content: space-between;">
+          <button type="button" id="send">보내기</button>
+          <button type="button" class="btn-ghost" id="cancelBtn" style="display:none;">정지</button>
+        </div>
         <span class="pill" id="chatStatus"></span>
       </div>
     </aside>
@@ -243,9 +257,13 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   const msgs = document.getElementById('msgs');
   const q = document.getElementById('q');
   const send = document.getElementById('send');
+  const cancelBtn = document.getElementById('cancelBtn');
   const statusEl = document.getElementById('chatStatus');
   const aiPages = document.getElementById('aiPages');
   const aiDeep = document.getElementById('aiDeep');
+  let chatAbort = null;
+  let chatTypingEl = null;
+  let chatJobId = null;
 
   function addBubble(text, who) {
     const d = document.createElement('div');
@@ -290,21 +308,36 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     return d;
   }
 
+  function resetChatUi(prevBtnText) {
+    send.disabled = false;
+    send.textContent = prevBtnText || '보내기';
+    statusEl.textContent = '';
+    cancelBtn.style.display = 'none';
+    chatAbort = null;
+    if (chatTypingEl && chatTypingEl.parentNode) chatTypingEl.parentNode.removeChild(chatTypingEl);
+    chatTypingEl = null;
+  }
+
   async function doSend() {
     const text = (q.value || '').trim();
     if (!text) return;
+    if (chatAbort) return; // 이미 처리 중이면 무시
     addBubble(text, 'user');
     q.value = '';
     send.disabled = true;
     const prevBtnText = send.textContent;
     send.textContent = '처리 중…';
     statusEl.textContent = 'AI가 답변을 만드는 중입니다…';
-    const typingEl = addTypingBubble();
+    chatTypingEl = addTypingBubble();
+    cancelBtn.style.display = 'inline-block';
+    chatAbort = new AbortController();
     try {
-      const mid = new URLSearchParams(window.location.search).get('mid') || 'Notice';
-      const r = await fetch('/api/chat', {
+      const mid = (sourceSel && sourceSel.value) ? sourceSel.value : 'deu';
+      // 1) 서버에 job 생성 요청
+      const r = await fetch('/api/chat/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: chatAbort.signal,
         body: JSON.stringify({
           message: text,
           mid: mid,
@@ -314,17 +347,50 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       });
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
-      if (typingEl && typingEl.parentNode) typingEl.parentNode.removeChild(typingEl);
-      addAiBubble(j.reply || '', j.sources || []);
+      chatJobId = j.job_id;
+
+      // 2) 완료될 때까지 폴링
+      while (true) {
+        await new Promise(res => setTimeout(res, 700));
+        const s = await fetch('/api/chat/status?job_id=' + encodeURIComponent(chatJobId), { signal: chatAbort.signal });
+        const sj = await s.json();
+        if (!s.ok) throw new Error(sj.error || ('HTTP ' + s.status));
+        if (sj.status === 'running') continue;
+        if (sj.status === 'cancelled') {
+          addBubble('요청을 정지했습니다.', 'ai');
+          break;
+        }
+        if (sj.status === 'error') {
+          throw new Error(sj.error || '서버 오류');
+        }
+        if (sj.status === 'done') {
+          addAiBubble(sj.reply || '', sj.sources || []);
+          break;
+        }
+        throw new Error('알 수 없는 상태: ' + sj.status);
+      }
     } catch (e) {
-      if (typingEl && typingEl.parentNode) typingEl.parentNode.removeChild(typingEl);
-      addBubble('오류: ' + e.message, 'ai');
+      if (e && e.name === 'AbortError') {
+        addBubble('요청을 정지했습니다.', 'ai');
+      } else {
+        addBubble('오류: ' + e.message, 'ai');
+      }
     } finally {
-      send.disabled = false;
-      send.textContent = prevBtnText;
-      statusEl.textContent = '';
+      resetChatUi(prevBtnText);
     }
   }
+
+  cancelBtn.addEventListener('click', () => {
+    // 서버 취소 요청 + 클라이언트 요청 중단
+    if (chatJobId) {
+      fetch('/api/chat/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job_id: chatJobId })
+      }).catch(()=>{});
+    }
+    if (chatAbort) chatAbort.abort();
+  });
 
   send.addEventListener('click', doSend);
   q.addEventListener('keydown', function (e) {
@@ -453,8 +519,8 @@ def _search_aggregated(*, mid: str, q: str, result_page: int, scan_pages: int, p
     }
 
 
-@app.post("/api/chat")
-def api_chat():
+@app.post("/api/chat/start")
+def api_chat_start():
     body = request.get_json(silent=True) or {}
     msg = (body.get("message") or "").strip()
     if not msg:
@@ -468,27 +534,103 @@ def api_chat():
     pages = max(1, min(20, pages))
     deep = bool(body.get("deep"))
 
-    try:
-        # 지연 로딩: 서버 시작 시 RAG/pandas/numpy import 지연
-        from deu_nexus.chat import answer_with_sources
+    job_id = _new_job_id()
+    cancel_event = threading.Event()
+    with _CHAT_LOCK:
+        _CHAT_JOBS[job_id] = {
+            "status": "running",
+            "cancel": cancel_event,
+            "result": None,
+            "error": None,
+        }
 
-        out = answer_with_sources(
-            msg,
-            mid=mid,
-            pages=pages,
-            include_article_bodies=deep,
-        )
-    except RuntimeError as e:
-        return jsonify({"error": str(e)}), 503
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    def _run() -> None:
+        try:
+            # 지연 로딩: 서버 시작 시 RAG/pandas/numpy import 지연
+            from deu_nexus.chat import answer_with_sources_cancellable
 
+            out = answer_with_sources_cancellable(
+                msg,
+                mid=mid,
+                pages=pages,
+                include_article_bodies=deep,
+                cancel_event=cancel_event,
+            )
+            with _CHAT_LOCK:
+                if cancel_event.is_set():
+                    _CHAT_JOBS[job_id]["status"] = "cancelled"
+                else:
+                    _CHAT_JOBS[job_id]["status"] = "done"
+                    _CHAT_JOBS[job_id]["result"] = out
+        except Exception as e:
+            with _CHAT_LOCK:
+                if cancel_event.is_set():
+                    _CHAT_JOBS[job_id]["status"] = "cancelled"
+                else:
+                    _CHAT_JOBS[job_id]["status"] = "error"
+                    _CHAT_JOBS[job_id]["error"] = str(e)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+@app.get("/api/chat/status")
+def api_chat_status():
+    job_id = (request.args.get("job_id") or "").strip()
+    if not job_id:
+        return jsonify({"error": "job_id가 필요합니다."}), 400
+    with _CHAT_LOCK:
+        job = _CHAT_JOBS.get(job_id)
+        if not job:
+            return jsonify({"error": "job_id를 찾을 수 없습니다."}), 404
+        status = job["status"]
+        if status == "done":
+            out = job.get("result") or {}
+            return jsonify(
+                {
+                    "status": "done",
+                    "reply": out.get("reply", ""),
+                    "sources": out.get("sources") or [],
+                    "crawl_summary": out.get("crawl_summary"),
+                    "ingest": out.get("ingest"),
+                }
+            )
+        if status == "error":
+            return jsonify({"status": "error", "error": job.get("error") or "서버 오류"}), 500
+        if status == "cancelled":
+            return jsonify({"status": "cancelled"})
+        return jsonify({"status": "running"})
+
+
+@app.post("/api/chat/cancel")
+def api_chat_cancel():
+    body = request.get_json(silent=True) or {}
+    job_id = (body.get("job_id") or "").strip()
+    if not job_id:
+        return jsonify({"error": "job_id가 필요합니다."}), 400
+    with _CHAT_LOCK:
+        job = _CHAT_JOBS.get(job_id)
+        if not job:
+            return jsonify({"error": "job_id를 찾을 수 없습니다."}), 404
+        job["cancel"].set()
+        job["status"] = "cancelled"
+    return jsonify({"status": "cancelled"})
+
+
+@app.get("/api/debug/env")
+def api_debug_env():
+    """로컬 디버그용: 서버가 환경변수를 보는지 확인(키 원문은 절대 반환하지 않음)."""
+    key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+    prefix = ""
+    if key:
+        prefix = key[:7] + "…"  # 예: sk-proj…
     return jsonify(
         {
-            "reply": out.get("reply", ""),
-            "sources": out.get("sources") or [],
-            "crawl_summary": out.get("crawl_summary"),
-            "ingest": out.get("ingest"),
+            "openai_api_key": {
+                "set": bool(key),
+                "prefix": prefix,
+                "length": len(key),
+            }
         }
     )
 
