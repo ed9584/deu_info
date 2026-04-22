@@ -1,5 +1,4 @@
 from typing import Any, Dict
-from deu_nexus.rag import answer_with_rag
 
 def answer_with_sources(
     user_message: str,
@@ -23,12 +22,12 @@ def answer_with_sources(
     if not user_message or not isinstance(user_message, str):
         raise ValueError("user_message must be a non-empty string.")
     
-    try:
-        return answer_with_rag(
-            user_message,
-            mid=mid,
-            pages=pages,
-            enrich_bodies=include_article_bodies,
-        )
-    except Exception as e:
-        return {"error": str(e), "message": "Failed to generate an answer with sources."}
+    # 지연 로딩: 서버 시작 시 pandas/numpy import 지연
+    from deu_nexus.rag import answer_with_rag
+
+    return answer_with_rag(
+        user_message,
+        mid=mid,
+        pages=pages,
+        enrich_bodies=include_article_bodies,
+    )

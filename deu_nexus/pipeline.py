@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
 from langchain_core.documents import Document
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -22,6 +21,8 @@ def ensure_data_dir() -> None:
 
 
 def crawl_to_dataframe(crawl: dict[str, Any]) -> pd.DataFrame:
+    import pandas as pd
+
     rows = list(crawl.get("articles") or [])
     if not rows:
         return pd.DataFrame(
@@ -77,6 +78,8 @@ def save_sqlite(df: pd.DataFrame, path: Path | None = None) -> Path:
 
 
 def dataframe_to_documents(df: pd.DataFrame) -> list[Document]:
+    import pandas as pd
+
     """Chroma/LangChain용 Document 리스트."""
     docs: list[Document] = []
     for _, row in df.iterrows():

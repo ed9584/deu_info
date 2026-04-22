@@ -11,7 +11,6 @@ from datetime import datetime
 from flask import Flask, jsonify, render_template_string, request
 
 from deu_nexus import APP_NAME, APP_NAME_KO
-from deu_nexus.chat import answer_with_sources
 from deu_nexus.crawler import DEFAULT_BASE, DEFAULT_DEU_NOTICE_URL, run_crawl, run_deu_notice_crawl
 
 app = Flask(__name__)
@@ -117,13 +116,13 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     <aside class="chat-panel">
       <div class="chat-head">
         <h2>AI 질문</h2>
-        <p class="chat-hint">질문마다 Selenium으로 공지를 받아 Pandas·SQLite에 저장하고 ChromaDB로 검색한 뒤 LangChain RAG로 답합니다. <code>OPENAI_API_KEY</code>는 서버에만 두세요.</p>
+        <p class="chat-hint">공지 내용을 바탕으로 답하고, 아래에 출처 링크를 함께 보여줍니다. (API 키는 서버에만 설정)</p>
         <div class="row">
-          <label class="pill">AI용 페이지
+          <label class="pill">공지 범위(페이지)
             <input type="number" id="aiPages" min="1" max="20" value="4" style="width:4rem;">
           </label>
           <label class="pill" style="flex-direction:row;align-items:center;gap:0.35rem;">
-            <input type="checkbox" id="aiDeep"> 본문까지 참고 (느림)
+            <input type="checkbox" id="aiDeep"> 본문까지 포함
           </label>
         </div>
       </div>
@@ -262,11 +261,12 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     const t = document.createElement('div');
     t.textContent = reply;
     d.appendChild(t);
-    if (sources && sources.length) {
+    const cleanSources = (sources || []).filter(x => x && typeof x === 'object' && x.url);
+    if (cleanSources.length) {
       const s = document.createElement('div');
       s.className = 'src';
       s.appendChild(document.createTextNode('출처:'));
-      sources.forEach(function (x) {
+      cleanSources.forEach(function (x) {
         const a = document.createElement('a');
         a.href = x.url;
         a.target = '_blank';
@@ -280,13 +280,26 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     msgs.scrollTop = msgs.scrollHeight;
   }
 
+  function addTypingBubble() {
+    const d = document.createElement('div');
+    d.className = 'bubble ai';
+    d.dataset.typing = '1';
+    d.textContent = '답변 생성 중…';
+    msgs.appendChild(d);
+    msgs.scrollTop = msgs.scrollHeight;
+    return d;
+  }
+
   async function doSend() {
     const text = (q.value || '').trim();
     if (!text) return;
     addBubble(text, 'user');
     q.value = '';
     send.disabled = true;
-    statusEl.textContent = '응답 중…';
+    const prevBtnText = send.textContent;
+    send.textContent = '처리 중…';
+    statusEl.textContent = 'AI가 답변을 만드는 중입니다…';
+    const typingEl = addTypingBubble();
     try {
       const mid = new URLSearchParams(window.location.search).get('mid') || 'Notice';
       const r = await fetch('/api/chat', {
@@ -301,11 +314,14 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       });
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+      if (typingEl && typingEl.parentNode) typingEl.parentNode.removeChild(typingEl);
       addAiBubble(j.reply || '', j.sources || []);
     } catch (e) {
+      if (typingEl && typingEl.parentNode) typingEl.parentNode.removeChild(typingEl);
       addBubble('오류: ' + e.message, 'ai');
     } finally {
       send.disabled = false;
+      send.textContent = prevBtnText;
       statusEl.textContent = '';
     }
   }
@@ -453,6 +469,9 @@ def api_chat():
     deep = bool(body.get("deep"))
 
     try:
+        # 지연 로딩: 서버 시작 시 RAG/pandas/numpy import 지연
+        from deu_nexus.chat import answer_with_sources
+
         out = answer_with_sources(
             msg,
             mid=mid,
