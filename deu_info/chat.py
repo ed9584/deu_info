@@ -1,10 +1,11 @@
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 def answer_with_sources(
     user_message: str,
     *,
-    mid: str = "Notice",
-    pages: int = 4,
+    mid: str = "deu",
+    sources: Optional[List[str]] = None,
+    pages: int = 1,
     include_article_bodies: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -12,8 +13,9 @@ def answer_with_sources(
 
     Args:
         user_message (str): The user's query message.
-        mid (str): The module ID to query (default: "Notice").
-        pages (int): The number of pages to search (default: 4).
+        mid (str): 단일 소스 레거시 (default: "deu").
+        sources: ['deu','dess'] 등 복수 소스(우선).
+        pages (int): 게시판 페이지 수 (default: 1).
         include_article_bodies (bool): Whether to include article bodies in the response.
 
     Returns:
@@ -23,11 +25,12 @@ def answer_with_sources(
         raise ValueError("user_message must be a non-empty string.")
     
     # 지연 로딩: 서버 시작 시 pandas/numpy import 지연
-    from deu_nexus.rag import answer_with_rag
+    from deu_info.rag import answer_with_rag
 
     return answer_with_rag(
         user_message,
         mid=mid,
+        sources=sources,
         pages=pages,
         enrich_bodies=include_article_bodies,
         cancel_event=None,
@@ -37,8 +40,9 @@ def answer_with_sources(
 def answer_with_sources_cancellable(
     user_message: str,
     *,
-    mid: str = "Notice",
-    pages: int = 4,
+    mid: str = "deu",
+    sources: Optional[List[str]] = None,
+    pages: int = 1,
     include_article_bodies: bool = False,
     cancel_event=None,
 ) -> Dict[str, Any]:
@@ -46,11 +50,12 @@ def answer_with_sources_cancellable(
     if not user_message or not isinstance(user_message, str):
         raise ValueError("user_message must be a non-empty string.")
 
-    from deu_nexus.rag import answer_with_rag
+    from deu_info.rag import answer_with_rag
 
     return answer_with_rag(
         user_message,
         mid=mid,
+        sources=sources,
         pages=pages,
         enrich_bodies=include_article_bodies,
         cancel_event=cancel_event,

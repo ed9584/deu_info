@@ -1,0 +1,16 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+.DS_Store
+.env
+.env.*
+!.env.example
+.idea/
+*.sqlite3-journal
+.pytest_cache/
+.mypy_cache/
+deu_info/local_data/

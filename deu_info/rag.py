@@ -16,7 +16,9 @@ from typing import Any
 
 from langchain_openai import ChatOpenAI
 
-from deu_nexus.crawler import (
+from concurrent.futures import ThreadPoolExecutor
+
+from deu_info.crawler import (
     DEFAULT_BASE,
     DEFAULT_DEU_NOTICE_URL,
     build_driver,
@@ -118,6 +120,99 @@ def _wants_list(msg: str) -> bool:
     return any(k in m for k in ("알려", "목록", "리스트", "뭐 올라왔", "뭐야", "공지"))
 
 
+def _message_suggests_notice_scope(msg: str) -> bool:
+    """공지·학사 질문일 가능성이 있으면 True (일반 잡담·다른 주제 오탐 방지). '뭐야' 단독은 넣지 않음."""
+    m = (msg or "").strip().lower()
+    if len(m) < 2:
+        return False
+    if any(k in m for k in ("요약", "정리", "핵심", "한줄", "한 줄")):
+        return True
+    scope = (
+        "알려", "목록", "리스트", "뭐 올라왔", "올라온", "올라왔", "공지", "게시", "안내", "학사",
+        "등록", "수강", "졸업", "입학", "휴학", "복학", "장학", "장학금", "교내", "동의대", "deu",
+        "dess", "학기", "수업", "시험", "기말", "중간", "계절", "납부", "분할", "증명서", "서류",
+        "신청", "마감", "일정", "행사", "모집", "총장", "학과", "전공", "실습", "봉사", "비교과",
+        "박물관", "도서관", "기숙사", "주차", "등교", "강의", "학점", "복수전공", "전과", "대학원",
+        "캠퍼스", "교수", "출석", "성적", "졸업요건", "학적", "휴강", "보강", "수강신청",
+    )
+    if any(k in m for k in scope):
+        return True
+    if re.search(r"20\d{2}", m):
+        return True
+    if re.search(r"\d{1,2}\s*월", m) or re.search(r"\d{4}[.\-]\d", m):
+        return True
+    return False
+
+
+def _max_article_match_score(user_message: str, arts: list[dict]) -> int:
+    return max((_score(user_message, str(a.get("title") or "")) for a in arts), default=0)
+
+
+def _is_likely_unrelated_to_notices(user_message: str, arts: list[dict]) -> bool:
+    if _message_suggests_notice_scope(user_message):
+        return False
+    return _max_article_match_score(user_message, arts) == 0
+
+
+def _normalize_rag_sources(sources: list[str] | None, mid: str | None) -> list[str]:
+    if sources:
+        out = sorted({str(s).strip() for s in sources if str(s).strip() in ("deu", "dess")}, key=lambda x: ("deu", "dess").index(x))
+        if out:
+            return out
+    m = (mid or "deu").strip()
+    if m in ("deu", "dess"):
+        return [m]
+    return ["deu"]
+
+
+def _load_merged_articles(*, sources: list[str], pages: int, cancel_event=None) -> tuple[list[dict], dict]:
+    """여러 소스 크롤 결과를 합치고 URL 기준 중복 제거. 각 글에 _origin('deu'|'dess') 부여."""
+    pages = max(1, min(20, int(pages)))
+    srcs = _normalize_rag_sources(sources, None)
+    if not srcs:
+        srcs = ["deu"]
+    combined: list[dict] = []
+    bases: list[str] = []
+    if len(srcs) == 1:
+        s0 = srcs[0]
+        arts, meta = _load_articles(source=s0, pages=pages, cancel_event=cancel_event)
+        bases.append(str(meta.get("base") or ""))
+        for a in arts:
+            a2 = dict(a)
+            a2["_origin"] = s0
+            combined.append(a2)
+    else:
+        order = {s: i for i, s in enumerate(("deu", "dess"))}
+        pending: list[tuple[str, object]] = []
+        with ThreadPoolExecutor(max_workers=min(2, len(srcs))) as ex:
+            for s in srcs:
+                pending.append((s, ex.submit(_load_articles, source=s, pages=pages, cancel_event=cancel_event)))
+        for s, fut in sorted(pending, key=lambda x: order.get(x[0], 99)):
+            arts, meta = fut.result()
+            bases.append(str(meta.get("base") or ""))
+            for a in arts:
+                a2 = dict(a)
+                a2["_origin"] = s
+                combined.append(a2)
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for a in combined:
+        u = str(a.get("url") or "").strip()
+        if u:
+            if u in seen:
+                continue
+            seen.add(u)
+        deduped.append(a)
+    merged_meta = {
+        "base": " · ".join(b for b in bases if b),
+        "source": "+".join(srcs),
+        "mid": "Notice",
+    }
+    if not merged_meta["base"]:
+        merged_meta["base"] = DEFAULT_DEU_NOTICE_URL if "deu" in srcs else DEFAULT_BASE
+    return deduped, merged_meta
+
+
 def _load_articles(*, source: str, pages: int, cancel_event=None) -> tuple[list[dict], dict]:
     """
     source: 'deu' | 'dess'
@@ -135,7 +230,7 @@ def _load_articles(*, source: str, pages: int, cancel_event=None) -> tuple[list[
         crawl = run_deu_notice_crawl(base_url=DEFAULT_DEU_NOTICE_URL, pages=pages, limit=10, cancel_event=cancel_event)
         crawl["source"]["source"] = "deu"
     else:
-        crawl = run_crawl(base=DEFAULT_BASE, mid="Notice", pages=pages, no_filter=True, fetch_body=False, headless=True, delay=0.35, cancel_event=cancel_event)
+        crawl = run_crawl(base=DEFAULT_BASE, mid="Notice", pages=pages, no_filter=True, fetch_body=False, headless=True, delay=0.22, cancel_event=cancel_event)
         crawl["source"]["source"] = "dess"
 
     arts = list(crawl.get("articles") or [])
@@ -177,7 +272,8 @@ def answer_with_rag(
     user_message: str,
     *,
     mid: str = "deu",
-    pages: int = 4,
+    sources: list[str] | None = None,
+    pages: int = 1,
     enrich_bodies: bool = False,
     cancel_event=None,
 ) -> dict[str, Any]:
@@ -196,15 +292,22 @@ def answer_with_rag(
             "ingest": None,
         }
 
-    source = (mid or "deu").strip()
-    # deu_nexus/web.js에서 sourceSel.value를 mid로 넘김: 'deu' | 'dess'
-    if source not in ("deu", "dess"):
-        source = "deu"
+    src_list = _normalize_rag_sources(sources, mid)
+    source_key = "+".join(src_list)
 
-    arts, src_meta = _load_articles(source=source, pages=pages, cancel_event=cancel_event)
+    arts, src_meta = _load_merged_articles(sources=src_list, pages=pages, cancel_event=cancel_event)
     arts = _filter_recent(arts)
     if not arts:
         return {"reply": "최근 공지 데이터가 없습니다.", "sources": [], "ingest": None}
+
+    if _is_likely_unrelated_to_notices(user_message, arts):
+        return {
+            "reply": "이 질문은 동의대 공지·학사 안내와 연관이 적어 보입니다. 등록, 수강, 공지, 일정, 장학 등 학교 관련 내용으로 질문해 주세요.",
+            "sources": [],
+            "notice_unrelated": True,
+            "crawl_summary": {"base": src_meta.get("base", ""), "source": source_key, "pages": pages},
+            "ingest": None,
+        }
 
     target_date = _extract_target_date(user_message)
     wants_summary = _wants_summary(user_message) or bool(enrich_bodies)
@@ -228,7 +331,7 @@ def answer_with_rag(
             return {
                 "reply": f"{target_date.strftime('%Y-%m-%d')}에 해당하는 공지를 최근 {MAX_AGE_DAYS}일 범위에서 찾지 못했습니다.",
                 "sources": [],
-                "crawl_summary": {"base": src_meta.get("base", ""), "source": source, "pages": pages},
+                "crawl_summary": {"base": src_meta.get("base", ""), "source": source_key, "pages": pages},
                 "ingest": None,
             }
         top = matched[:10]
@@ -238,15 +341,15 @@ def answer_with_rag(
         sources = _format_sources(top)
         # 요약 요청이면 본문 요약(느림)
         if wants_summary:
-            return _summarize_selected(user_message, top, source=source, cancel_event=cancel_event, src_meta=src_meta, base_pages=pages)
-        return {"reply": reply.strip(), "sources": sources, "crawl_summary": {"base": src_meta.get("base", ""), "source": source, "pages": pages}, "ingest": None}
+            return _summarize_selected(user_message, top, source=source_key, cancel_event=cancel_event, src_meta=src_meta, base_pages=pages)
+        return {"reply": reply.strip(), "sources": sources, "crawl_summary": {"base": src_meta.get("base", ""), "source": source_key, "pages": pages}, "ingest": None}
 
     # 2) 일반 검색: 제목 기반 빠른 후보 추출
     scored = sorted(arts, key=lambda a: _score(user_message, str(a.get("title") or "")), reverse=True)
     scored = [a for a in scored if _score(user_message, str(a.get("title") or "")) > 0] or scored
     picked = scored[:6]
     if wants_summary:
-        return _summarize_selected(user_message, picked, source=source, cancel_event=cancel_event, src_meta=src_meta, base_pages=pages)
+        return _summarize_selected(user_message, picked, source=source_key, cancel_event=cancel_event, src_meta=src_meta, base_pages=pages)
 
     # 요약이 아니면 “관련 공지 후보”를 빠르게 제시
     reply = "관련 공지 후보를 찾았습니다. 아래 목록에서 원하는 항목을 말해주면 요약/정리해드릴게요.\n"
@@ -255,7 +358,7 @@ def answer_with_rag(
     return {
         "reply": reply.strip(),
         "sources": _format_sources(picked),
-        "crawl_summary": {"base": src_meta.get("base", ""), "source": source, "pages": pages},
+        "crawl_summary": {"base": src_meta.get("base", ""), "source": source_key, "pages": pages},
         "ingest": None,
     }
 
@@ -264,7 +367,7 @@ def _summarize_selected(
     user_message: str,
     picked: list[dict],
     *,
-    source: str,
+    source: str,  # 표시용: "deu", "dess", "deu+dess" 등
     cancel_event=None,
     src_meta: dict | None = None,
     base_pages: int = 4,
@@ -274,12 +377,14 @@ def _summarize_selected(
     if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
         return {"reply": "요청이 취소되었습니다.", "sources": [], "ingest": None}
 
-    # 본문 수집: DESS는 Selenium selector가 있어 수집 가능. 대표 공지는 본문이 비어있을 수 있어 제목 기반 요약으로 대체.
+    # 본문 수집: DESS 글만 Selenium으로 본문 수집. 대표 공지는 제목·메타 위주.
     bodies: list[str] = []
-    if source == "dess":
+    if any(str(a.get("_origin") or "") == "dess" for a in picked):
         driver = build_driver(headless=True)
         try:
             for a in picked[:3]:
+                if str(a.get("_origin") or "") != "dess":
+                    continue
                 if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
                     break
                 url = str(a.get("url") or "")
